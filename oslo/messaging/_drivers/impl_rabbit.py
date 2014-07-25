@@ -18,7 +18,9 @@ import logging
 import socket
 import ssl
 import time
+import threading
 import uuid
+import weakref
 
 import kombu
 import kombu.connection
@@ -98,6 +100,10 @@ rabbit_opts = [
                 help='Use HA queues in RabbitMQ (x-ha-policy: all). '
                      'If you change this option, you must wipe the '
                      'RabbitMQ database.'),
+
+    cfg.IntOpt('rabbit_heartbeat',
+               default=60,
+               help='seconds between rabbit keep-alive heartbeat.'),
 
     # FIXME(markmc): this was toplevel in openstack.common.rpc
     cfg.BoolOpt('fake_rabbit',
@@ -316,22 +322,40 @@ class FanoutConsumer(ConsumerBase):
 class Publisher(object):
     """Base Publisher class."""
 
-    def __init__(self, channel, exchange_name, routing_key, **kwargs):
+    def __init__(self, conf, channel, exchange_name, routing_key, **kwargs):
         """Init the Publisher class with the exchange_name, routing_key,
         and other options
         """
         self.exchange_name = exchange_name
         self.routing_key = routing_key
         self.kwargs = kwargs
+        self.options = {
+            'durable': conf.amqp_durable_queues,
+            'queue_arguments': _get_queue_arguments(conf),
+            'auto_delete': conf.amqp_auto_delete,
+            'exclusive': False,
+        }
+        self.options.update(kwargs)
         self.reconnect(channel)
 
     def reconnect(self, channel):
         """Re-establish the Producer after a rabbit reconnection."""
         self.exchange = kombu.entity.Exchange(name=self.exchange_name,
-                                              **self.kwargs)
+                                              **self.options)
         self.producer = kombu.messaging.Producer(exchange=self.exchange,
                                                  channel=channel,
                                                  routing_key=self.routing_key)
+
+        # NOTE(noelbk) If rabbit dies, the consumer can be
+        # disconnected before the publisher sends, and if the
+        # publisher hasn't delared the queue, the publisher's message
+        # may be lost.
+        self.queue = kombu.entity.Queue(channel=channel,
+                                        exchange=self.exchange,
+                                        name=self.exchange_name,
+                                        routing_key=self.routing_key,
+                                        **self.options)
+        self.queue.declare()
 
     def send(self, msg, timeout=None):
         """Send a message."""
@@ -351,13 +375,8 @@ class DirectPublisher(Publisher):
 
         Kombu options may be passed as keyword args to override defaults
         """
-
-        options = {'durable': False,
-                   'auto_delete': True,
-                   'exclusive': False}
-        options.update(kwargs)
-        super(DirectPublisher, self).__init__(channel, msg_id, msg_id,
-                                              type='direct', **options)
+        super(DirectPublisher, self).__init__(conf, channel, msg_id, msg_id,
+                                              type='direct', **kwargs)
 
 
 class TopicPublisher(Publisher):
@@ -367,16 +386,13 @@ class TopicPublisher(Publisher):
 
         Kombu options may be passed as keyword args to override defaults
         """
-        options = {'durable': conf.amqp_durable_queues,
-                   'auto_delete': conf.amqp_auto_delete,
-                   'exclusive': False}
-        options.update(kwargs)
         exchange_name = rpc_amqp.get_control_exchange(conf)
-        super(TopicPublisher, self).__init__(channel,
+        super(TopicPublisher, self).__init__(conf,
+                                             channel,
                                              exchange_name,
                                              topic,
                                              type='topic',
-                                             **options)
+                                             **kwargs)
 
 
 class FanoutPublisher(Publisher):
@@ -386,41 +402,28 @@ class FanoutPublisher(Publisher):
 
         Kombu options may be passed as keyword args to override defaults
         """
-        options = {'durable': False,
-                   'auto_delete': True,
-                   'exclusive': False}
-        options.update(kwargs)
-        super(FanoutPublisher, self).__init__(channel, '%s_fanout' % topic,
-                                              None, type='fanout', **options)
+        super(FanoutPublisher, self).__init__(conf,
+                                              channel,
+                                              '%s_fanout' % topic,
+                                              None,
+                                              type='fanout',
+                                              **kwargs)
 
 
 class NotifyPublisher(TopicPublisher):
     """Publisher class for 'notify'."""
-
-    def __init__(self, conf, channel, topic, **kwargs):
-        self.durable = kwargs.pop('durable', conf.amqp_durable_queues)
-        self.queue_arguments = _get_queue_arguments(conf)
-        super(NotifyPublisher, self).__init__(conf, channel, topic, **kwargs)
-
-    def reconnect(self, channel):
-        super(NotifyPublisher, self).reconnect(channel)
-
-        # NOTE(jerdfelt): Normally the consumer would create the queue, but
-        # we do this to ensure that messages don't get dropped if the
-        # consumer is started after we do
-        queue = kombu.entity.Queue(channel=channel,
-                                   exchange=self.exchange,
-                                   durable=self.durable,
-                                   name=self.routing_key,
-                                   routing_key=self.routing_key,
-                                   queue_arguments=self.queue_arguments)
-        queue.declare()
+    pass
 
 
 class Connection(object):
     """Connection object."""
 
     pool = None
+
+    _CONNECTIONS = []
+
+    def enable_heartbeat_reconnect(self):
+        self._CONNECTIONS.append(weakref.ref(self))
 
     def __init__(self, conf, server_params=None):
         self.consumers = []
@@ -561,6 +564,9 @@ class Connection(object):
         LOG.info(_('Connected to AMQP server on %(hostname)s:%(port)d') %
                  params)
 
+    def send_heartbeat(self):
+        self.connection.heartbeat_check()
+
     def reconnect(self):
         """Handles reconnecting and re-establishing queues.
         Will retry up to self.max_retries number of times.
@@ -648,7 +654,16 @@ class Connection(object):
 
     def close(self):
         """Close/release this connection."""
-        self.connection.release()
+        if not self.connection:
+            return
+
+        try:
+            self.connection.release()
+            self.connection.close()
+        except self.connection_errors:
+            pass
+        # Setting this in case the next statement fails, though
+        # it shouldn't be doing any network operations, yet.
         self.connection = None
 
     def reset(self):
@@ -758,12 +773,48 @@ class Connection(object):
 
     def consume(self, limit=None, timeout=None):
         """Consume from all queues/consumers."""
-        it = self.iterconsume(limit=limit, timeout=timeout)
+        if timeout:
+            deadline = time.time() + timeout
+        else:
+            deadline = None
         while True:
             try:
-                six.next(it)
-            except StopIteration:
-                return
+                it = self.iterconsume(limit=limit, timeout=1)
+                while True:
+                    try:
+                        six.next(it)
+                    except StopIteration:
+                        return
+            except rpc_common.Timeout:
+                pass
+            if deadline and deadline - time.time() < 0:
+                raise rpc_common.Timeout()
+
+
+class HeartbeatThread(threading.Thread):
+    def __init__(self, driver, conn):
+        super(HeartbeatThread, self).__init__()
+        self._conn = conn
+        self._driver = driver
+        self.daemon = True
+
+    def run(self):
+        while True:
+            try:
+                self._conn.send_heartbeat()
+            except Exception:
+                LOG.exception('Heartbeats failed. trying to reconnect')
+                compacted_list = [c for c in Connection._CONNECTIONS if c()]
+                Connection._CONNECTIONS = compacted_list
+                for connection in Connection._CONNECTIONS:
+                    connection = connection()
+                    if not connection:  # Weakref not valid
+                        continue
+                    connection.reconnect()
+            try:
+                self._conn.connection.connection.drain_events(timeout=1)
+            except Exception:
+                pass
 
 
 class RabbitDriver(amqpdriver.AMQPDriverBase):
@@ -779,6 +830,15 @@ class RabbitDriver(amqpdriver.AMQPDriverBase):
                                            connection_pool,
                                            default_exchange,
                                            allowed_remote_exmods)
+        temp_server_params = self._server_params
+
+        self._server_params = {'heartbeat': self.conf.rabbit_heartbeat}
+        heartbeat_connection = self._get_connection(pooled=False)
+        heartbeat_connection.enable_heartbeat_reconnect()  # hack
+        self._server_params = temp_server_params
+
+        self._heartbeat = HeartbeatThread(self, heartbeat_connection)
+        self._heartbeat.start()
 
     def require_features(self, requeue=True):
         pass

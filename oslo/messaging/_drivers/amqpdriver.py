@@ -1,4 +1,3 @@
-
 # Copyright 2013 Red Hat, Inc.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -348,6 +347,7 @@ class AMQPDriverBase(base.BaseDriver):
             reply_q = 'reply_' + uuid.uuid4().hex
 
             conn = self._get_connection(pooled=False)
+            conn.enable_heartbeat_reconnect()  # hack
 
             self._waiter = ReplyWaiter(self.conf, reply_q, conn,
                                        self._allowed_remote_exmods)
@@ -417,6 +417,7 @@ class AMQPDriverBase(base.BaseDriver):
 
     def listen(self, target):
         conn = self._get_connection(pooled=False)
+        conn.enable_heartbeat_reconnect()  # hack
 
         listener = AMQPListener(self, conn)
 
@@ -429,6 +430,7 @@ class AMQPDriverBase(base.BaseDriver):
 
     def listen_for_notifications(self, targets_and_priorities):
         conn = self._get_connection(pooled=False)
+        conn.enable_heartbeat_reconnect()  # hack
 
         listener = AMQPListener(self, conn)
         for target, priority in targets_and_priorities:
